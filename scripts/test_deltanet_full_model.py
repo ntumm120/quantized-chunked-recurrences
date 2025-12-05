@@ -31,6 +31,7 @@ from fla.ops.delta_rule.naive import (
     delta_rule_recurrence_native_dtype as delta_rule_recurrence,
     delta_rule_chunkwise_native_dtype as delta_rule_chunkwise,
     delta_rule_parallel_native_dtype as delta_rule_parallel,
+    delta_rule_parallel_scan_native_dtype as delta_rule_parallel_scan,
 )
 
 
@@ -120,6 +121,8 @@ def patch_deltanet_layer_forward(layer, kernel_mode='recurrence', compute_dtype=
                 o = o[:, :, :q_len, :]
             else:
                 o, _ = delta_rule_parallel(q, k, v, beta, BM=BM, BN=BN)
+        elif kernel_mode == 'parallel_scan':
+            o, _ = delta_rule_parallel_scan(q, k, v, beta)
         else:
             raise ValueError(f"Unknown kernel mode: {kernel_mode}")
 
@@ -309,7 +312,7 @@ def main():
 
     # Configuration
     seq_lengths = [128, 256, 512, 1024]
-    kernels = ['recurrence', 'chunkwise', 'parallel']
+    kernels = ['recurrence', 'chunkwise', 'parallel', 'parallel_scan']
 
     # Different INT8 granularities (coarse to fine)
     quant_configs = [
@@ -366,8 +369,8 @@ def main():
             torch.cuda.empty_cache()
 
     # Create plots: 1 row with subplots for each granularity
-    colors = {'recurrence': 'tab:blue', 'chunkwise': 'tab:orange', 'parallel': 'tab:green'}
-    markers = {'recurrence': 'o', 'chunkwise': 's', 'parallel': '^'}
+    colors = {'recurrence': 'tab:blue', 'chunkwise': 'tab:orange', 'parallel': 'tab:green', 'parallel_scan': 'tab:red'}
+    markers = {'recurrence': 'o', 'chunkwise': 's', 'parallel': '^', 'parallel_scan': 'd'}
     quant_names = [c[2] for c in quant_configs]
 
     for metric in ['mean', 'max']:
@@ -424,17 +427,18 @@ def main():
     plt.close()
 
     # Print summary table
-    print("\n" + "="*80)
+    print("\n" + "="*100)
     print("SUMMARY: INT8 Quantization Error at seq_len=1024 (BF16 compute)")
-    print("="*80)
-    print(f"\n{'Granularity':<15} {'recurrence':<15} {'chunkwise':<15} {'parallel':<15} {'rec/par ratio':<15}")
-    print("-"*75)
+    print("="*100)
+    print(f"\n{'Granularity':<15} {'recurrence':<15} {'chunkwise':<15} {'parallel':<15} {'parallel_scan':<15} {'rec/pscan':<12}")
+    print("-"*90)
     for quant_name in quant_names:
         rec = results[quant_name][1024]['recurrence']['mean']
         chu = results[quant_name][1024]['chunkwise']['mean']
         par = results[quant_name][1024]['parallel']['mean']
-        ratio = rec / par if par > 0 else 0
-        print(f"{quant_name:<15} {rec:<15.2e} {chu:<15.2e} {par:<15.2e} {ratio:<15.2f}")
+        pscan = results[quant_name][1024]['parallel_scan']['mean']
+        ratio = rec / pscan if pscan > 0 else 0
+        print(f"{quant_name:<15} {rec:<15.2e} {chu:<15.2e} {par:<15.2e} {pscan:<15.2e} {ratio:<12.2f}")
 
 
 if __name__ == "__main__":

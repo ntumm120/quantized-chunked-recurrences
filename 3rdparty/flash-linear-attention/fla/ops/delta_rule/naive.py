@@ -358,6 +358,219 @@ def delta_rule_parallel_native_dtype(q, k, v, beta, BM=128, BN=32):
     return o, A
 
 
+def delta_rule_chunkwise_parallel_scan(q, k, v, beta, chunk_size=32):
+    """
+    Hybrid chunkwise + parallel scan implementation.
+
+    Combines efficient intra-chunk computation (O(C^2) attention) with
+    parallel scan for inter-chunk state propagation (O(log(L/C)) depth).
+
+    This gives:
+    - Better numerical stability than pure chunkwise (fewer sequential steps)
+    - Much lower memory than pure parallel scan (O(C^2) vs O(L * d_k^2))
+    - Similar speed to chunkwise for large chunk sizes
+
+    The inter-chunk recurrence S_{c+1} = A_c @ S_c + B_c is parallelized:
+    - A_c: cumulative transition matrix for chunk c
+    - B_c: accumulated state contribution from chunk c
+    """
+    orig_dtype = q.dtype
+    device = q.device
+    b, h, l, d_k = q.shape
+    d_v = v.shape[-1]
+
+    q = q.float() * (d_k ** -0.5)
+    k = k.float()
+    v = v.float()
+    beta = beta.float()
+
+    v_beta = v * beta[..., None]
+    k_beta = k * beta[..., None]
+
+    assert l % chunk_size == 0
+    num_chunks = l // chunk_size
+
+    # Reshape into chunks
+    q_chunks = rearrange(q, 'b h (n c) d -> b h n c d', c=chunk_size)
+    k_chunks = rearrange(k, 'b h (n c) d -> b h n c d', c=chunk_size)
+    v_chunks = rearrange(v_beta, 'b h (n c) d -> b h n c d', c=chunk_size)
+    k_beta_chunks = rearrange(k_beta, 'b h (n c) d -> b h n c d', c=chunk_size)
+
+    # === Step 1: Compute intra-chunk transformation matrix ===
+    # (I - tri(diag(beta) KK^T))^{-1}
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=0)
+    attn = -(k_beta_chunks @ k_chunks.transpose(-1, -2)).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        attn[..., i, :i] = attn[..., i, :i] + (attn[..., i, :, None].clone() * attn[..., :, :i].clone()).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=torch.float32, device=device)
+
+    # u = transformed v, w = transformed k_beta
+    u = attn @ v_chunks  # (b, h, n, c, d_v)
+    w = attn @ k_beta_chunks  # (b, h, n, c, d_k)
+
+    # === Step 2: Compute per-chunk transition matrices A_c and additive terms B_c ===
+    I = torch.eye(d_k, dtype=torch.float32, device=device)
+
+    # Derive A_c and B_c from the inter-chunk recurrence:
+    # S_{c+1} = S_c + K_c^T @ (U_c - W_c @ S_c)
+    #         = (I - K_c^T @ W_c) @ S_c + K_c^T @ U_c
+    # So: A_c = I - K_c^T @ W_c, B_c = K_c^T @ U_c
+    A_chunks = I.unsqueeze(0).unsqueeze(0).expand(b, h, num_chunks, d_k, d_k).clone()
+    # K^T @ W: einsum over chunk positions c
+    A_chunks = A_chunks - torch.einsum('bhncd,bhnce->bhnde', k_chunks, w)
+
+    # B_c = K_c^T @ U_c
+    B_chunks = torch.einsum('bhncd,bhnce->bhnde', k_chunks, u)
+
+    # === Step 3: Parallel scan over chunks ===
+    A_scan = A_chunks.clone()
+    B_scan = B_chunks.clone()
+
+    step = 1
+    while step < num_chunks:
+        A_shifted = torch.cat([
+            I.expand(b, h, step, d_k, d_k),
+            A_scan[:, :, :-step]
+        ], dim=2)
+        B_shifted = torch.cat([
+            torch.zeros(b, h, step, d_k, d_v, dtype=torch.float32, device=device),
+            B_scan[:, :, :-step]
+        ], dim=2)
+
+        A_new = torch.einsum('bhnij,bhnjk->bhnik', A_scan, A_shifted)
+        B_new = torch.einsum('bhnij,bhnjk->bhnik', A_scan, B_shifted) + B_scan
+
+        A_scan = A_new
+        B_scan = B_new
+        step *= 2
+
+    # B_scan[:,:,c] now contains S_c (state after processing chunk c)
+    # We need S_{c-1} for computing outputs in chunk c
+    S_prev = torch.cat([
+        torch.zeros(b, h, 1, d_k, d_v, dtype=torch.float32, device=device),
+        B_scan[:, :, :-1]
+    ], dim=2)
+
+    # === Step 4: Compute outputs using scanned states ===
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=1)
+    o = torch.zeros(b, h, num_chunks, chunk_size, d_v, dtype=torch.float32, device=device)
+
+    for c in range(num_chunks):
+        q_c = q_chunks[:, :, c]  # (b, h, chunk_size, d_k)
+        k_c = k_chunks[:, :, c]
+        u_c = u[:, :, c]
+        w_c = w[:, :, c]
+        S_c = S_prev[:, :, c]  # (b, h, d_k, d_v)
+
+        # Intra-chunk attention
+        attn_intra = (q_c @ k_c.transpose(-1, -2)).masked_fill_(mask, 0)
+
+        # Adjust u for incoming state
+        u_adjusted = u_c - w_c @ S_c
+
+        # Output = inter-chunk (q @ S_prev) + intra-chunk
+        o_inter = q_c @ S_c  # (b, h, chunk_size, d_v)
+        o_intra = attn_intra @ u_adjusted
+        o[:, :, c] = o_inter + o_intra
+
+    o = rearrange(o, 'b h n c d -> b h (n c) d')
+    S_final = B_scan[:, :, -1]
+
+    return o.to(orig_dtype), S_final
+
+
+def delta_rule_chunkwise_parallel_scan_native_dtype(q, k, v, beta, chunk_size=32):
+    """
+    Hybrid chunkwise + parallel scan, native dtype version.
+
+    Same algorithm as delta_rule_chunkwise_parallel_scan but preserves
+    input dtype (fp16/bf16) throughout computation.
+    """
+    dtype = q.dtype
+    device = q.device
+    b, h, l, d_k = q.shape
+    d_v = v.shape[-1]
+
+    q = q * (d_k ** -0.5)
+    v_beta = v * beta[..., None]
+    k_beta = k * beta[..., None]
+
+    assert l % chunk_size == 0
+    num_chunks = l // chunk_size
+
+    # Reshape into chunks
+    q_chunks = rearrange(q, 'b h (n c) d -> b h n c d', c=chunk_size)
+    k_chunks = rearrange(k, 'b h (n c) d -> b h n c d', c=chunk_size)
+    v_chunks = rearrange(v_beta, 'b h (n c) d -> b h n c d', c=chunk_size)
+    k_beta_chunks = rearrange(k_beta, 'b h (n c) d -> b h n c d', c=chunk_size)
+
+    # Compute intra-chunk transformation matrix
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=0)
+    attn = -(k_beta_chunks @ k_chunks.transpose(-1, -2)).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        attn[..., i, :i] = attn[..., i, :i] + (attn[..., i, :, None].clone() * attn[..., :, :i].clone()).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=dtype, device=device)
+
+    u = attn @ v_chunks
+    w = attn @ k_beta_chunks
+
+    I = torch.eye(d_k, dtype=dtype, device=device)
+
+    # Compute per-chunk A and B: A_c = I - K_c^T @ W_c, B_c = K_c^T @ U_c
+    A_chunks = I.unsqueeze(0).unsqueeze(0).expand(b, h, num_chunks, d_k, d_k).clone()
+    A_chunks = A_chunks - torch.einsum('bhncd,bhnce->bhnde', k_chunks, w)
+    B_chunks = torch.einsum('bhncd,bhnce->bhnde', k_chunks, u)
+
+    # Parallel scan
+    A_scan = A_chunks.clone()
+    B_scan = B_chunks.clone()
+
+    step = 1
+    while step < num_chunks:
+        A_shifted = torch.cat([
+            I.expand(b, h, step, d_k, d_k),
+            A_scan[:, :, :-step]
+        ], dim=2)
+        B_shifted = torch.cat([
+            torch.zeros(b, h, step, d_k, d_v, dtype=dtype, device=device),
+            B_scan[:, :, :-step]
+        ], dim=2)
+
+        A_new = torch.einsum('bhnij,bhnjk->bhnik', A_scan, A_shifted)
+        B_new = torch.einsum('bhnij,bhnjk->bhnik', A_scan, B_shifted) + B_scan
+
+        A_scan = A_new
+        B_scan = B_new
+        step *= 2
+
+    S_prev = torch.cat([
+        torch.zeros(b, h, 1, d_k, d_v, dtype=dtype, device=device),
+        B_scan[:, :, :-1]
+    ], dim=2)
+
+    # Compute outputs
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device), diagonal=1)
+    o = torch.zeros(b, h, num_chunks, chunk_size, d_v, dtype=dtype, device=device)
+
+    for c in range(num_chunks):
+        q_c = q_chunks[:, :, c]
+        k_c = k_chunks[:, :, c]
+        u_c = u[:, :, c]
+        w_c = w[:, :, c]
+        S_c = S_prev[:, :, c]
+
+        attn_intra = (q_c @ k_c.transpose(-1, -2)).masked_fill_(mask, 0)
+        u_adjusted = u_c - w_c @ S_c
+        o_inter = q_c @ S_c
+        o_intra = attn_intra @ u_adjusted
+        o[:, :, c] = o_inter + o_intra
+
+    o = rearrange(o, 'b h n c d -> b h (n c) d')
+    S_final = B_scan[:, :, -1]
+
+    return o, S_final
+
+
 def delta_rule_parallel_scan_native_dtype(q, k, v, beta, initial_state=None, output_final_state=True):
     """
     Parallel scan (Hillis-Steele) that preserves input dtype (fp16/bf16).
